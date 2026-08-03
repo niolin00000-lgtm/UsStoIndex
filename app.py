@@ -30,13 +30,12 @@ st.caption(f"🕒 **最後更新時間：** `{now_str}` ｜ 結合 8 個週級�
 @st.cache_data(ttl=1800)
 def load_multi_factor_data(days_back):
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back + 200) # 需要足夠數據計算週級與 MA
+    start_date = end_date - timedelta(days=days_back + 250) # 預留足夠天數算 200MA
     
-    # 擴充獲取的標的資產列表
+    # 標的與對應 ticker
     tickers = {
         'SPY': 'SPY',         # 標普 500 現貨
         'US10Y': '^TNX',       # 10年期美債殖利率
-        'US02Y': '^IRX',       # 13週/短天期利率代理 (或用 2Y 代理)
         'VIX': '^VIX',         # 30天恐慌指數
         'VIX1D': '^VIX1D',     # 1天期極速恐慌指數
         'HYG': 'HYG',         # 高收益債
@@ -51,87 +50,90 @@ def load_multi_factor_data(days_back):
     ticker_list = list(tickers.values())
     raw_data = yf.download(ticker_list, start=start_date, end=end_date, progress=False)
     
-    if raw_data.empty or 'Close' not in raw_data:
+    if raw_data.empty:
         return pd.DataFrame()
         
-    close_data = raw_data['Close']
+    # 安全獲取 Close 欄位（相容 MultiIndex 與單層 Index）
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        if 'Close' in raw_data.columns.levels[0]:
+            close_data = raw_data['Close']
+        else:
+            close_data = raw_data.xs('Close', axis=1, level=0, droplevel=False)
+    else:
+        close_data = raw_data
+
+    # 重構 DataFrame
     df = pd.DataFrame()
-    
     for key, symbol in tickers.items():
-        if symbol in close_data:
+        if symbol in close_data.columns:
             df[key] = close_data[symbol]
             
-    df = df.ffill().dropna()
-    if df.empty:
+    # 資料清理：先用前向填充（處理交易日不一），再用後向填充補齊開頭
+    df = df.ffill().bfill()
+    
+    # 若核心欄位依然缺失則回傳空值
+    required_cols = ['SPY', 'VIX', 'HYG', 'LQD', 'US10Y']
+    if not all(col in df.columns for col in required_cols) or df.empty:
         return pd.DataFrame()
 
+    # 若特定變動較大的 API 欄位缺失，以備用邏輯補齊
+    if 'VIX1D' not in df.columns or df['VIX1D'].isnull().all():
+        df['VIX1D'] = df['VIX'] # 備用防護
+
     # ==========================================
-    # 🔵 第一層：週級別總體氛圍指標 (Weekly Layer - 8 Factors)
+    # 🔵 第一層：週級別總體氛圍指標 (Weekly Layer)
     # ==========================================
-    # 1. 消費信心/避險偏好 (XLY / XLP)
     df['W_Discretionary_Defensive'] = df['XLY'] / df['XLP']
-    # 2. 信用市場中線趨勢 (HYG / LQD 20日均線)
-    df['W_Credit_Trend'] = (df['HYG'] / df['LQD']).rolling(20).mean()
-    # 3. 標普 500 均線偏離度 (市場過熱/過冷度)
-    df['W_SPY_SMA50_Ratio'] = df['SPY'] / df['SPY'].rolling(50).mean()
-    df['W_SPY_SMA200_Ratio'] = df['SPY'] / df['SPY'].rolling(200).mean()
-    # 4. 波動率中線基底 (VIX 20日均值)
-    df['W_VIX_Baseline'] = df['VIX'].rolling(20).mean()
-    # 5. 殖利率曲線斜率 (US10Y - US02Y 代理)
-    df['W_Yield_Curve'] = df['US10Y'] - df['US02Y']
-    # 6. 美元中線強弱 (DXY 20日 MA)
-    df['W_DXY_Trend'] = df['DXY'].rolling(20).mean()
-    # 7. 小型股對大盤中線比值 (市場廣度)
-    df['W_Breadth_Trend'] = (df['IWM'] / df['SPY']).rolling(20).mean()
+    df['W_Credit_Trend'] = (df['HYG'] / df['LQD']).rolling(20, min_periods=5).mean()
+    df['W_SPY_SMA50_Ratio'] = df['SPY'] / df['SPY'].rolling(50, min_periods=10).mean()
+    df['W_SPY_SMA200_Ratio'] = df['SPY'] / df['SPY'].rolling(200, min_periods=20).mean()
+    df['W_VIX_Baseline'] = df['VIX'].rolling(20, min_periods=5).mean()
+    df['W_DXY_Trend'] = df['DXY'].rolling(20, min_periods=5).mean()
+    df['W_Breadth_Trend'] = (df['IWM'] / df['SPY']).rolling(20, min_periods=5).mean()
 
     # 計算週級綜合氣氛分數 (Weekly Sentiment Score: 0~100)
     w_w = 60
-    z_w1 = (df['W_Discretionary_Defensive'] - df['W_Discretionary_Defensive'].rolling(w_w).mean()) / df['W_Discretionary_Defensive'].rolling(w_w).std()
-    z_w2 = (df['W_Credit_Trend'] - df['W_Credit_Trend'].rolling(w_w).mean()) / df['W_Credit_Trend'].rolling(w_w).std()
-    z_w3 = (df['W_SPY_SMA50_Ratio'] - df['W_SPY_SMA50_Ratio'].rolling(w_w).mean()) / df['W_SPY_SMA50_Ratio'].rolling(w_w).std()
-    z_w4 = -1 * (df['W_VIX_Baseline'] - df['W_VIX_Baseline'].rolling(w_w).mean()) / df['W_VIX_Baseline'].rolling(w_w).std()
+    z_w1 = (df['W_Discretionary_Defensive'] - df['W_Discretionary_Defensive'].rolling(w_w, min_periods=10).mean()) / (df['W_Discretionary_Defensive'].rolling(w_w, min_periods=10).std() + 1e-6)
+    z_w2 = (df['W_Credit_Trend'] - df['W_Credit_Trend'].rolling(w_w, min_periods=10).mean()) / (df['W_Credit_Trend'].rolling(w_w, min_periods=10).std() + 1e-6)
+    z_w3 = (df['W_SPY_SMA50_Ratio'] - df['W_SPY_SMA50_Ratio'].rolling(w_w, min_periods=10).mean()) / (df['W_SPY_SMA50_Ratio'].rolling(w_w, min_periods=10).std() + 1e-6)
+    z_w4 = -1 * (df['W_VIX_Baseline'] - df['W_VIX_Baseline'].rolling(w_w, min_periods=10).mean()) / (df['W_VIX_Baseline'].rolling(w_w, min_periods=10).std() + 1e-6)
     
     weekly_logit = (z_w1 * 0.3) + (z_w2 * 0.3) + (z_w3 * 0.2) + (z_w4 * 0.2)
-    df['Weekly_Regime_Score'] = (1 / (1 + np.exp(-weekly_logit))) * 100
+    df['Weekly_Regime_Score'] = (1 / (1 + np.exp(-weekly_logit.fillna(0)))) * 100
 
     # ==========================================
-    # 🔴 第二層：日級別極速衝擊指標 (Daily Layer - 7 Factors)
+    # 🔴 第二層：日級別極速衝擊指標 (Daily Layer)
     # ==========================================
-    # 1. 1日極速恐慌倒掛比 (VIX1D / VIX)
     df['D_VIX_Structure'] = df['VIX1D'] / df['VIX']
-    # 2. VIX 1日變化率
     df['D_VIX_1D_Pct'] = df['VIX'].pct_change(1)
-    # 3. 10年期美債 1日衝擊
     df['D_US10Y_1D_Chg'] = df['US10Y'].diff(1)
-    # 4. 美元指數 1日變動
     df['D_DXY_1D_Pct'] = df['DXY'].pct_change(1)
-    # 5. 信用利差 1日急轉
     df['D_Credit_1D_Pct'] = (df['HYG'] / df['LQD']).pct_change(1)
-    # 6. 小型股相對強度 1日變動
     df['D_Breadth_1D_Pct'] = (df['IWM'] / df['SPY']).pct_change(1)
-    # 7. 台積電 ADR 1日衝擊 (AI/科技風向)
     df['D_TSM_1D_Pct'] = df['TSM'].pct_change(1)
 
     # 計算日級極速風險分數 (Daily Shock Score: 0~100)
     w_d = 20
-    z_d1 = (df['D_VIX_Structure'] - df['D_VIX_Structure'].rolling(w_d).mean()) / df['D_VIX_Structure'].rolling(w_d).std()
-    z_d2 = (df['D_US10Y_1D_Chg'] - df['D_US10Y_1D_Chg'].rolling(w_d).mean()) / df['D_US10Y_1D_Chg'].rolling(w_d).std()
-    z_d3 = (df['D_DXY_1D_Pct'] - df['D_DXY_1D_Pct'].rolling(w_d).mean()) / df['D_DXY_1D_Pct'].rolling(w_d).std()
-    z_d4 = -1 * (df['D_Credit_1D_Pct'] - df['D_Credit_1D_Pct'].rolling(w_d).mean()) / df['D_Credit_1D_Pct'].rolling(w_d).std()
-    z_d5 = -1 * (df['D_TSM_1D_Pct'] - df['D_TSM_1D_Pct'].rolling(w_d).mean()) / df['D_TSM_1D_Pct'].rolling(w_d).std()
+    z_d1 = (df['D_VIX_Structure'] - df['D_VIX_Structure'].rolling(w_d, min_periods=5).mean()) / (df['D_VIX_Structure'].rolling(w_d, min_periods=5).std() + 1e-6)
+    z_d2 = (df['D_US10Y_1D_Chg'] - df['D_US10Y_1D_Chg'].rolling(w_d, min_periods=5).mean()) / (df['D_US10Y_1D_Chg'].rolling(w_d, min_periods=5).std() + 1e-6)
+    z_d3 = (df['D_DXY_1D_Pct'] - df['D_DXY_1D_Pct'].rolling(w_d, min_periods=5).mean()) / (df['D_DXY_1D_Pct'].rolling(w_d, min_periods=5).std() + 1e-6)
+    z_d4 = -1 * (df['D_Credit_1D_Pct'] - df['D_Credit_1D_Pct'].rolling(w_d, min_periods=5).mean()) / (df['D_Credit_1D_Pct'].rolling(w_d, min_periods=5).std() + 1e-6)
+    z_d5 = -1 * (df['D_TSM_1D_Pct'] - df['D_TSM_1D_Pct'].rolling(w_d, min_periods=5).mean()) / (df['D_TSM_1D_Pct'].rolling(w_d, min_periods=5).std() + 1e-6)
 
     daily_logit = (z_d1 * 1.0) + (z_d2 * 0.8) + (z_d3 * 0.6) + (z_d4 * 0.6) + (z_d5 * 0.5)
-    df['Daily_Shock_Score'] = (1 / (1 + np.exp(-daily_logit))) * 100
+    df['Daily_Shock_Score'] = (1 / (1 + np.exp(-daily_logit.fillna(0)))) * 100
 
     # ==========================================
-    # 🟣 雙層融合預測機率 (Integrated Forecast Probability)
+    # 🟣 雙層融合預測機率 (Integrated Forecast)
     # ==========================================
-    # 邏輯：週級氣氛作為濾網 (40% 權重)，日級衝擊作為觸發器 (60% 權重)
     df['Final_Prob_Down_2448H'] = (df['Weekly_Regime_Score'] * 0.4) + (df['Daily_Shock_Score'] * 0.6)
 
-    return df.tail(days_back).dropna()
+    # 清理所有中間計算產生的極少數 NaN
+    df = df.fillna(method='ffill').fillna(method='bfill')
 
-with st.spinner("正在加載多維度 15 個基底指標並計算雙層模型..."):
+    return df.tail(days_back)
+
+with st.spinner("正在加載多維度指標並計算雙層模型..."):
     df = load_multi_factor_data(days)
 
 if not df.empty and len(df) >= 2:
@@ -151,7 +153,7 @@ if not df.empty and len(df) >= 2:
 
     st.markdown("---")
 
-    # 歷史走勢圖表 (雙層 vs 綜合)
+    # 歷史走勢圖表
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df.index, y=df['Final_Prob_Down_2448H'], mode='lines', name='綜合預測機率 (%)', line=dict(color='crimson', width=3)))
     fig.add_trace(go.Scatter(x=df.index, y=df['Weekly_Regime_Score'], mode='lines', name='週級脆弱度濾網 (%)', line=dict(color='royalblue', width=1.5, dash='dot')))
@@ -167,16 +169,14 @@ if not df.empty and len(df) >= 2:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ==========================================
-    # 🔍 底層數據與基底指標全揭露面板 (15 個指標)
-    # ==========================================
-    st.subheader("🔍 底層基底指標透明化面板 (Base Indicators Explicit Metrics)")
+    # 底層數據面板
+    st.subheader("🔍 底層基底指標透明化面板")
     st.write("以下為模型計算所使用的所有原始指數與衍生特徵當前最新數值：")
 
     col_w, col_d = st.columns(2)
 
     with col_w:
-        st.markdown("### 🔵 週級總體與氛圍指標 (Weekly Base Metrics)")
+        st.markdown("### 🔵 週級總體與氛圍指標")
         weekly_data = {
             "基底指標名稱": [
                 "標普500現貨 (SPY)", 
@@ -197,22 +197,12 @@ if not df.empty and len(df) >= 2:
                 f"{latest['W_VIX_Baseline']:.2f}",
                 f"{latest['W_DXY_Trend']:.2f}",
                 f"{latest['W_Breadth_Trend']:.3f}"
-            ],
-            "狀態解讀": [
-                "基準大盤價格",
-                "高代表消費信心強",
-                "越高代表信用市場資金充沛",
-                ">1.0 代表站在50日線之上",
-                ">1.0 代表長線多頭結構",
-                "中線波動率平均水位",
-                "中線美元流動性水位",
-                "越高代表中小企業參與度高"
             ]
         }
         st.table(pd.DataFrame(weekly_data))
 
     with col_d:
-        st.markdown("### 🔴 日級極速與衝擊指標 (Daily Base Metrics)")
+        st.markdown("### 🔴 日級極速與衝擊指標")
         daily_data = {
             "基底指標名稱": [
                 "1日極速恐慌比 (VIX1D/VIX)", 
@@ -231,18 +221,9 @@ if not df.empty and len(df) >= 2:
                 f"{latest['D_DXY_1D_Pct']*100:+.2f}%",
                 f"{latest['D_Credit_1D_Pct']*100:+.2f}%",
                 f"{latest['D_TSM_1D_Pct']*100:+.2f}%"
-            ],
-            "狀態解讀": [
-                "≥1.0 代表極速倒掛避險",
-                "當前市場隱含波動率",
-                "無風險利率基準",
-                "突發飆升會打壓科技股",
-                "急漲代表全球流動性收緊",
-                "負值代表高收益債被拋售",
-                "科技與 AI 供應鏈風向球"
             ]
         }
         st.table(pd.DataFrame(daily_data))
 
 else:
-    st.error("⚠️ 無法獲取多因子數據，請重新整理頁面或點擊左側刷新按鈕。")
+    st.error("⚠️ 無法獲取多因子數據，請重新整理頁面或點擊左側「🔄 重新載入最新 API 數據」按鈕。")
