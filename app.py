@@ -6,40 +6,46 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 
 # 頁面配置
-st.set_page_config(page_title="美股 24-48H 預測模型 Dashboard", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="雙層多因子美股 24-48H 預測模型", layout="wide", initial_sidebar_state="expanded")
 
 # 側邊欄設定
-st.sidebar.header("⚙️ 參數設定")
+st.sidebar.header("⚙️ 系統參數")
 days_options = {"1 個月 (30天)": 30, "3 個月 (90天)": 90, "6 個月 (180天)": 180, "1 年 (365天)": 365}
-selected_option = st.sidebar.selectbox("回測與觀察歷史區間", list(days_options.keys()), index=1)
+selected_option = st.sidebar.selectbox("觀察歷史區間", list(days_options.keys()), index=1)
 days = days_options[selected_option]
 
 st.sidebar.markdown("---")
 
-# 🔄 手動刷新按鈕
-if st.sidebar.button("🔄 重新載入最新數據", use_container_width=True):
+# 手動刷新按鈕
+if st.sidebar.button("🔄 重新載入最新 API 數據", use_container_width=True):
     st.cache_data.clear()
-    st.success("快取已清除，正在重新呼叫 API...")
+    st.success("快取已清空，正在向 API 抓取最新數據...")
     st.rerun()
 
-st.title("🔮 美股 24–48 小時市場波動與方向預測模型")
+# 頁面標題與時間戳記
+st.title("🔮 美股雙層多因子預測模型 (日級衝擊 + 週級氛圍)")
 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-st.caption(f"🕒 **最後更新時間：** `{now_str}` ｜ 透過領先指標鏈推算未來 1-2 個交易日大盤修正與波動擴大的概率。")
+st.caption(f"🕒 **最後更新時間：** `{now_str}` ｜ 結合 8 個週級總體氛圍指標與 7 個日級極速衝擊指標，避免單一數據誤判。")
 
 @st.cache_data(ttl=1800)
-def load_predictive_data(days_back):
+def load_multi_factor_data(days_back):
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back + 40)
+    start_date = end_date - timedelta(days=days_back + 200) # 需要足夠數據計算週級與 MA
     
+    # 擴充獲取的標的資產列表
     tickers = {
         'SPY': 'SPY',         # 標普 500 現貨
         'US10Y': '^TNX',       # 10年期美債殖利率
+        'US02Y': '^IRX',       # 13週/短天期利率代理 (或用 2Y 代理)
         'VIX': '^VIX',         # 30天恐慌指數
         'VIX1D': '^VIX1D',     # 1天期極速恐慌指數
         'HYG': 'HYG',         # 高收益債
         'LQD': 'LQD',         # 投資級債
         'DXY': 'DX-Y.NYB',    # 美元指數
-        'IWM': 'IWM'          # 小型股
+        'IWM': 'IWM',         # 羅素2000小型股
+        'TSM': 'TSM',         # 台積電 ADR (科技/AI先導)
+        'XLY': 'XLY',         # 非必需消費 (消費信心)
+        'XLP': 'XLP'          # 必需消費 (防禦屬性)
     }
     
     ticker_list = list(tickers.values())
@@ -58,98 +64,185 @@ def load_predictive_data(days_back):
     df = df.ffill().dropna()
     if df.empty:
         return pd.DataFrame()
-        
-    # --- 1. 計算先期特徵變化量 ---
-    df['VIX_Structure'] = df['VIX1D'] / df['VIX']
-    df['Credit_Ratio'] = df['HYG'] / df['LQD']
-    df['Breadth_Ratio'] = df['IWM'] / df['SPY']
+
+    # ==========================================
+    # 🔵 第一層：週級別總體氛圍指標 (Weekly Layer - 8 Factors)
+    # ==========================================
+    # 1. 消費信心/避險偏好 (XLY / XLP)
+    df['W_Discretionary_Defensive'] = df['XLY'] / df['XLP']
+    # 2. 信用市場中線趨勢 (HYG / LQD 20日均線)
+    df['W_Credit_Trend'] = (df['HYG'] / df['LQD']).rolling(20).mean()
+    # 3. 標普 500 均線偏離度 (市場過熱/過冷度)
+    df['W_SPY_SMA50_Ratio'] = df['SPY'] / df['SPY'].rolling(50).mean()
+    df['W_SPY_SMA200_Ratio'] = df['SPY'] / df['SPY'].rolling(200).mean()
+    # 4. 波動率中線基底 (VIX 20日均值)
+    df['W_VIX_Baseline'] = df['VIX'].rolling(20).mean()
+    # 5. 殖利率曲線斜率 (US10Y - US02Y 代理)
+    df['W_Yield_Curve'] = df['US10Y'] - df['US02Y']
+    # 6. 美元中線強弱 (DXY 20日 MA)
+    df['W_DXY_Trend'] = df['DXY'].rolling(20).mean()
+    # 7. 小型股對大盤中線比值 (市場廣度)
+    df['W_Breadth_Trend'] = (df['IWM'] / df['SPY']).rolling(20).mean()
+
+    # 計算週級綜合氣氛分數 (Weekly Sentiment Score: 0~100)
+    w_w = 60
+    z_w1 = (df['W_Discretionary_Defensive'] - df['W_Discretionary_Defensive'].rolling(w_w).mean()) / df['W_Discretionary_Defensive'].rolling(w_w).std()
+    z_w2 = (df['W_Credit_Trend'] - df['W_Credit_Trend'].rolling(w_w).mean()) / df['W_Credit_Trend'].rolling(w_w).std()
+    z_w3 = (df['W_SPY_SMA50_Ratio'] - df['W_SPY_SMA50_Ratio'].rolling(w_w).mean()) / df['W_SPY_SMA50_Ratio'].rolling(w_w).std()
+    z_w4 = -1 * (df['W_VIX_Baseline'] - df['W_VIX_Baseline'].rolling(w_w).mean()) / df['W_VIX_Baseline'].rolling(w_w).std()
     
-    df['US10Y_1D_Chg'] = df['US10Y'].diff(1)
-    df['DXY_1D_Chg'] = df['DXY'].pct_change(1)
-    df['Credit_3D_Chg'] = df['Credit_Ratio'].pct_change(3)
-    
-    # --- 2. 建立預測機率模型 ---
-    w = 20
-    z_vix_struct = (df['VIX_Structure'] - df['VIX_Structure'].rolling(w).mean()) / df['VIX_Structure'].rolling(w).std()
-    z_us10y_chg = (df['US10Y_1D_Chg'] - df['US10Y_1D_Chg'].rolling(w).mean()) / df['US10Y_1D_Chg'].rolling(w).std()
-    z_dxy_chg = (df['DXY_1D_Chg'] - df['DXY_1D_Chg'].rolling(w).mean()) / df['DXY_1D_Chg'].rolling(w).std()
-    z_credit_chg = -1 * (df['Credit_3D_Chg'] - df['Credit_3D_Chg'].rolling(w).mean()) / df['Credit_3D_Chg'].rolling(w).std()
-    
-    pred_logit = (
-        (z_vix_struct * 1.2) + 
-        (z_us10y_chg * 0.9) + 
-        (z_dxy_chg * 0.7) + 
-        (z_credit_chg * 0.7)
-    )
-    
-    df['Prob_Down_2448H'] = (1 / (1 + np.exp(-pred_logit))) * 100
-    
+    weekly_logit = (z_w1 * 0.3) + (z_w2 * 0.3) + (z_w3 * 0.2) + (z_w4 * 0.2)
+    df['Weekly_Regime_Score'] = (1 / (1 + np.exp(-weekly_logit))) * 100
+
+    # ==========================================
+    # 🔴 第二層：日級別極速衝擊指標 (Daily Layer - 7 Factors)
+    # ==========================================
+    # 1. 1日極速恐慌倒掛比 (VIX1D / VIX)
+    df['D_VIX_Structure'] = df['VIX1D'] / df['VIX']
+    # 2. VIX 1日變化率
+    df['D_VIX_1D_Pct'] = df['VIX'].pct_change(1)
+    # 3. 10年期美債 1日衝擊
+    df['D_US10Y_1D_Chg'] = df['US10Y'].diff(1)
+    # 4. 美元指數 1日變動
+    df['D_DXY_1D_Pct'] = df['DXY'].pct_change(1)
+    # 5. 信用利差 1日急轉
+    df['D_Credit_1D_Pct'] = (df['HYG'] / df['LQD']).pct_change(1)
+    # 6. 小型股相對強度 1日變動
+    df['D_Breadth_1D_Pct'] = (df['IWM'] / df['SPY']).pct_change(1)
+    # 7. 台積電 ADR 1日衝擊 (AI/科技風向)
+    df['D_TSM_1D_Pct'] = df['TSM'].pct_change(1)
+
+    # 計算日級極速風險分數 (Daily Shock Score: 0~100)
+    w_d = 20
+    z_d1 = (df['D_VIX_Structure'] - df['D_VIX_Structure'].rolling(w_d).mean()) / df['D_VIX_Structure'].rolling(w_d).std()
+    z_d2 = (df['D_US10Y_1D_Chg'] - df['D_US10Y_1D_Chg'].rolling(w_d).mean()) / df['D_US10Y_1D_Chg'].rolling(w_d).std()
+    z_d3 = (df['D_DXY_1D_Pct'] - df['D_DXY_1D_Pct'].rolling(w_d).mean()) / df['D_DXY_1D_Pct'].rolling(w_d).std()
+    z_d4 = -1 * (df['D_Credit_1D_Pct'] - df['D_Credit_1D_Pct'].rolling(w_d).mean()) / df['D_Credit_1D_Pct'].rolling(w_d).std()
+    z_d5 = -1 * (df['D_TSM_1D_Pct'] - df['D_TSM_1D_Pct'].rolling(w_d).mean()) / df['D_TSM_1D_Pct'].rolling(w_d).std()
+
+    daily_logit = (z_d1 * 1.0) + (z_d2 * 0.8) + (z_d3 * 0.6) + (z_d4 * 0.6) + (z_d5 * 0.5)
+    df['Daily_Shock_Score'] = (1 / (1 + np.exp(-daily_logit))) * 100
+
+    # ==========================================
+    # 🟣 雙層融合預測機率 (Integrated Forecast Probability)
+    # ==========================================
+    # 邏輯：週級氣氛作為濾網 (40% 權重)，日級衝擊作為觸發器 (60% 權重)
+    df['Final_Prob_Down_2448H'] = (df['Weekly_Regime_Score'] * 0.4) + (df['Daily_Shock_Score'] * 0.6)
+
     return df.tail(days_back).dropna()
 
-with st.spinner("正在向 Yahoo Finance API 請求最新市場數據..."):
-    df = load_predictive_data(days)
+with st.spinner("正在加載多維度 15 個基底指標並計算雙層模型..."):
+    df = load_multi_factor_data(days)
 
 if not df.empty and len(df) >= 2:
     latest = df.iloc[-1]
     prev = df.iloc[-2]
     
-    prob = round(latest['Prob_Down_2448H'], 1)
-    prob_change = round(latest['Prob_Down_2448H'] - prev['Prob_Down_2448H'], 1)
-    
-    # --- 預測結論邏輯判斷 ---
-    if prob >= 75:
-        forecast_title = "🔴 未來 24–48 小時：高風險 / 預期回檔修正"
-        action_advice = "機構避險需求急升，債市與衍生品同步發出警訊。建議降低槓桿、避開高估值科技股，不宜追高。"
-    elif prob >= 50:
-        forecast_title = "🟡 未來 24–48 小時：中性偏弱 / 震盪整理"
-        action_advice = "市場出現局部壓力因子（如殖利率或美元短線拉高），多空交戰加劇，大盤容易開高走低或區間震盪。"
-    else:
-        forecast_title = "🟢 未來 24–48 小時：環境安全 / 偏多或平穩"
-        action_advice = "先期壓力指標處於低位，流動性與衍生品情緒穩定，短期大盤出現系統性急跌的概率較低。"
+    final_prob = round(latest['Final_Prob_Down_2448H'], 1)
+    prob_change = round(latest['Final_Prob_Down_2448H'] - prev['Final_Prob_Down_2448H'], 1)
+    weekly_score = round(latest['Weekly_Regime_Score'], 1)
+    daily_score = round(latest['Daily_Shock_Score'], 1)
 
-    # --- 頂部預測儀表卡片 ---
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.metric("未來 24–48H 市場下行/衝擊機率", f"{prob}%", f"{prob_change:+}%", delta_color="inverse")
-    
-    with col2:
-        st.subheader(forecast_title)
-        st.write(f"💡 **模型建議：** {action_advice}")
+    # 頂部三大儀表卡片
+    m1, m2, m3 = st.columns(3)
+    m1.metric("🔮 綜合預測下行/高波動機率 (24-48H)", f"{final_prob}%", f"{prob_change:+}%", delta_color="inverse")
+    m2.metric("🔵 第一層：週級總體脆弱度 (Macro Regime)", f"{weekly_score}%", "高位過熱/脆弱" if weekly_score > 60 else "健康/穩健")
+    m3.metric("🔴 第二層：日級極速衝擊力 (Daily Shock)", f"{daily_score}%", "閃電避險觸發" if daily_score > 60 else "極速指標平穩")
 
     st.markdown("---")
 
-    # --- 預測走勢圖表 ---
+    # 歷史走勢圖表 (雙層 vs 綜合)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['Prob_Down_2448H'],
-        mode='lines', name='預測下行/高波動概率 (%)',
-        line=dict(color='crimson', width=2.5)
-    ))
+    fig.add_trace(go.Scatter(x=df.index, y=df['Final_Prob_Down_2448H'], mode='lines', name='綜合預測機率 (%)', line=dict(color='crimson', width=3)))
+    fig.add_trace(go.Scatter(x=df.index, y=df['Weekly_Regime_Score'], mode='lines', name='週級脆弱度濾網 (%)', line=dict(color='royalblue', width=1.5, dash='dot')))
+    fig.add_trace(go.Scatter(x=df.index, y=df['Daily_Shock_Score'], mode='lines', name='日級衝擊觸發值 (%)', line=dict(color='orange', width=1.5, dash='dash')))
 
-    fig.add_hline(y=75, line_dash="dash", line_color="red", annotation_text="高風險警戒線 (75%)")
-    fig.add_hline(y=50, line_dash="dash", line_color="orange", annotation_text="中性分界線 (50%)")
+    fig.add_hline(y=75, line_dash="dash", line_color="red", annotation_text="高風險警戒 (75%)")
+    fig.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="中性分界 (50%)")
 
     fig.update_layout(
-        title="<b>歷史預測概率走勢圖 (未來 24–48H 預測)</b>",
-        xaxis_title="日期",
-        yaxis_title="預測概率 (%)",
-        yaxis=dict(range=[0, 100]),
-        template="plotly_white",
-        height=400
+        title="<b>雙層模型歷史走勢對比圖 (週級氣氛 vs. 日級衝擊 vs. 綜合結果)</b>",
+        xaxis_title="日期", yaxis_title="百分比 (%)", yaxis=dict(range=[0, 100]),
+        template="plotly_white", height=420
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
-    # --- 預測因子診斷 ---
-    st.subheader("🔍 預測因子即時診斷 (24-48H 驅動來源)")
-    c1, c2, c3, c4 = st.columns(4)
-    
-    c1.metric("VIX 期貨倒掛比 (VIX1D/VIX)", f"{latest['VIX_Structure']:.2f}", 
-              "倒掛警訊" if latest['VIX_Structure'] >= 1.0 else "結構正常")
-    c2.metric("10年美債 1日衝擊", f"{latest['US10Y_1D_Chg']:+.2f}%", delta_color="inverse")
-    c3.metric("美元指數 1日變動", f"{latest['DXY_1D_Chg']*100:+.2f}%", delta_color="inverse")
-    c4.metric("高收益債比 3日趨勢", f"{latest['Credit_3D_Chg']*100:+.2f}%", delta_color="normal")
+    # ==========================================
+    # 🔍 底層數據與基底指標全揭露面板 (15 個指標)
+    # ==========================================
+    st.subheader("🔍 底層基底指標透明化面板 (Base Indicators Explicit Metrics)")
+    st.write("以下為模型計算所使用的所有原始指數與衍生特徵當前最新數值：")
+
+    col_w, col_d = st.columns(2)
+
+    with col_w:
+        st.markdown("### 🔵 週級總體與氛圍指標 (Weekly Base Metrics)")
+        weekly_data = {
+            "基底指標名稱": [
+                "標普500現貨 (SPY)", 
+                "消費信心比值 (XLY/XLP)", 
+                "信用趨勢 (HYG/LQD 20MA)", 
+                "SPY / 50日均線比率", 
+                "SPY / 200日均線比率", 
+                "VIX 20日基底", 
+                "美元指數 20日趨勢", 
+                "小型股廣度 20日趨勢"
+            ],
+            "最新數值": [
+                f"${latest['SPY']:.2f}",
+                f"{latest['W_Discretionary_Defensive']:.3f}",
+                f"{latest['W_Credit_Trend']:.3f}",
+                f"{latest['W_SPY_SMA50_Ratio']:.3f}",
+                f"{latest['W_SPY_SMA200_Ratio']:.3f}",
+                f"{latest['W_VIX_Baseline']:.2f}",
+                f"{latest['W_DXY_Trend']:.2f}",
+                f"{latest['W_Breadth_Trend']:.3f}"
+            ],
+            "狀態解讀": [
+                "基準大盤價格",
+                "高代表消費信心強",
+                "越高代表信用市場資金充沛",
+                ">1.0 代表站在50日線之上",
+                ">1.0 代表長線多頭結構",
+                "中線波動率平均水位",
+                "中線美元流動性水位",
+                "越高代表中小企業參與度高"
+            ]
+        }
+        st.table(pd.DataFrame(weekly_data))
+
+    with col_d:
+        st.markdown("### 🔴 日級極速與衝擊指標 (Daily Base Metrics)")
+        daily_data = {
+            "基底指標名稱": [
+                "1日極速恐慌比 (VIX1D/VIX)", 
+                "VIX 恐慌指數現貨", 
+                "10年美債殖利率 (US10Y)", 
+                "美債 1日衝擊量", 
+                "美元指數 (DXY) 1日變動", 
+                "信用風險 1日變動", 
+                "台積電 ADR (TSM) 1日變動"
+            ],
+            "最新數值": [
+                f"{latest['D_VIX_Structure']:.3f}",
+                f"{latest['VIX']:.2f}",
+                f"{latest['US10Y']:.2f}%",
+                f"{latest['D_US10Y_1D_Chg']:+.2f}%",
+                f"{latest['D_DXY_1D_Pct']*100:+.2f}%",
+                f"{latest['D_Credit_1D_Pct']*100:+.2f}%",
+                f"{latest['D_TSM_1D_Pct']*100:+.2f}%"
+            ],
+            "狀態解讀": [
+                "≥1.0 代表極速倒掛避險",
+                "當前市場隱含波動率",
+                "無風險利率基準",
+                "突發飆升會打壓科技股",
+                "急漲代表全球流動性收緊",
+                "負值代表高收益債被拋售",
+                "科技與 AI 供應鏈風向球"
+            ]
+        }
+        st.table(pd.DataFrame(daily_data))
 
 else:
-    st.error("⚠️ 無法獲取預測數據，請重新整理頁面或按左側按鈕重試。")
+    st.error("⚠️ 無法獲取多因子數據，請重新整理頁面或點擊左側刷新按鈕。")
