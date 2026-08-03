@@ -129,7 +129,8 @@ def load_multi_factor_data(days_back):
     df['Final_Prob_Down_2448H'] = (df['Weekly_Regime_Score'] * 0.4) + (df['Daily_Shock_Score'] * 0.6)
 
     # 清理所有中間計算產生的極少數 NaN
-    df = df.fillna(method='ffill').fillna(method='bfill')
+    # ✅ 新版相容語法
+    df = df.ffill().bfill()
 
     return df.tail(days_back)
 
